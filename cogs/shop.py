@@ -5,6 +5,7 @@ from database import db
 from utils.ui import PremiumEmbed
 import json
 from utils.logger import log
+from config import Config  # <--- Tambahkan baris ini
 
 class CustomFieldModal(discord.ui.Modal):
     def __init__(self, product_id, variant_id, custom_fields):
