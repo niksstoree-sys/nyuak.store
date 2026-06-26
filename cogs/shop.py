@@ -4,9 +4,9 @@ from discord.ext import commands
 from database import db
 from utils.ui import PremiumEmbed
 import json
+from utils.logger import log
 
 class CustomFieldModal(discord.ui.Modal):
-    """Dynamic client inputs generated programmatically matching store items selection."""
     def __init__(self, product_id, variant_id, custom_fields):
         super().__init__(title="Required Product Information")
         self.product_id = product_id
@@ -27,40 +27,42 @@ class CustomFieldModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        
-        # Structure answers into key value array and serialize
-        answers = {}
-        for i, f in enumerate(self.fields_metadata):
-            answers[f["label"]] = self.text_inputs[i].value
+        try:
+            answers = {}
+            for i, f in enumerate(self.fields_metadata):
+                answers[f["label"]] = self.text_inputs[i].value
 
-        answers_json = json.dumps(answers)
-        variant = db.fetch_one("SELECT * FROM variants WHERE id = ?", (self.variant_id,))
-        final_price = variant["price"] - variant["discount"]
+            answers_json = json.dumps(answers)
+            variant = db.fetch_one("SELECT * FROM variants WHERE id = ?", (self.variant_id,))
+            final_price = variant["price"] - variant["discount"]
 
-        # Fetch Enabled Payment Options
-        gateways = db.fetch_all("SELECT * FROM payment_methods WHERE enabled = 1")
-        if not gateways:
+            gateways = db.fetch_all("SELECT * FROM payment_methods WHERE enabled = 1")
+            if not gateways:
+                await interaction.followup.send(
+                    embed=PremiumEmbed.error("Configuration Required", "Store is temporarily locked (No active payment mechanisms)."),
+                    ephemeral=True
+                )
+                return
+
+            order_id = db.execute(
+                "INSERT INTO orders (user_id, product_id, variant_id, custom_inputs, price, payment_status, order_status) VALUES (?, ?, ?, ?, ?, 'Pending', 'Pending')",
+                (interaction.user.id, self.product_id, self.variant_id, answers_json, final_price)
+            )
+
+            selector_view = PaymentGatewayView(order_id, gateways, final_price)
+            invoice_embed = PremiumEmbed.info(
+                f"Invoice Created: #{order_id}",
+                f"Please complete verification parameters below.\n\n"
+                f"Item ID: {self.product_id}\n"
+                f"Subtotal: {final_price:.2f} USD"
+            )
+            await interaction.followup.send(embed=invoice_embed, view=selector_view, ephemeral=True)
+        except Exception as e:
+            log.error(f"Error in CustomFieldModal submit: {e}")
             await interaction.followup.send(
-                embed=PremiumEmbed.error("Configuration Required", "Store is temporarily locked (No active payment mechanisms)."),
+                embed=PremiumEmbed.error("System Error", "An error occurred while creating your invoice. Please contact staff."),
                 ephemeral=True
             )
-            return
-
-        order_id = db.execute(
-            "INSERT INTO orders (user_id, product_id, variant_id, custom_inputs, price, payment_status, order_status) VALUES (?, ?, ?, ?, ?, 'Pending', 'Pending')",
-            (interaction.user.id, self.product_id, self.variant_id, answers_json, final_price)
-        )
-
-        # Build interactive invoice gateway selector
-        selector_view = PaymentGatewayView(order_id, gateways, final_price)
-        invoice_embed = PremiumEmbed.info(
-            f"Invoice Created: #{order_id}",
-            f"Please complete verification parameters below.\n\n"
-            f"Item ID: {self.product_id}\n"
-            f"Subtotal: {final_price:.2f} USD\n"
-            f"System: Noctra Vault System"
-        )
-        await interaction.followup.send(embed=invoice_embed, view=selector_view, ephemeral=True)
 
 
 class PaymentGatewayView(discord.ui.View):
@@ -82,21 +84,28 @@ class PaymentSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        method_id = int(self.values[0])
-        gateway = db.fetch_one("SELECT * FROM payment_methods WHERE id = ?", (method_id,))
-        
-        db.execute(
-            "UPDATE orders SET payment_method_id = ? WHERE id = ?",
-            (method_id, self.order_id)
-        )
+        try:
+            method_id = int(self.values[0])
+            gateway = db.fetch_one("SELECT * FROM payment_methods WHERE id = ?", (method_id,))
+            
+            db.execute(
+                "UPDATE orders SET payment_method_id = ? WHERE id = ?",
+                (method_id, self.order_id)
+            )
 
-        instruction_embed = PremiumEmbed.info(
-            f"Invoice Setup Complete: #{self.order_id}",
-            f"Instructions:\n"
-            f"{gateway['instructions']}\n\n"
-            f"Please complete payment and open a Support Ticket linking Order ID: {self.order_id}."
-        )
-        await interaction.followup.send(embed=instruction_embed, ephemeral=True)
+            instruction_embed = PremiumEmbed.info(
+                f"Invoice Setup Complete: #{self.order_id}",
+                f"Instructions:\n"
+                f"{gateway['instructions']}\n\n"
+                f"Please complete payment and open a Support Ticket linking Order ID: {self.order_id}."
+            )
+            await interaction.followup.send(embed=instruction_embed, ephemeral=True)
+        except Exception as e:
+            log.error(f"Error in PaymentSelect: {e}")
+            await interaction.followup.send(
+                embed=PremiumEmbed.error("Gateway Error", "Could not process the selected payment gateway."),
+                ephemeral=True
+            )
 
 
 class VariantSelect(discord.ui.Select):
@@ -113,35 +122,43 @@ class VariantSelect(discord.ui.Select):
         super().__init__(placeholder="Select Variant", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        variant_id = int(self.values[0])
-        if self.fields:
-            # Trigger dynamic modal UI requirements to prevent interaction timeout
-            modal = CustomFieldModal(self.product_id, variant_id, self.fields)
-            await interaction.response.send_modal(modal)
-        else:
-            await interaction.response.defer(ephemeral=True)
-            variant = db.fetch_one("SELECT * FROM variants WHERE id = ?", (variant_id,))
-            final_price = variant["price"] - variant["discount"]
-            gateways = db.fetch_all("SELECT * FROM payment_methods WHERE enabled = 1")
-            
-            if not gateways:
-                await interaction.followup.send(
-                    embed=PremiumEmbed.error("Config Required", "Store has no active payment methods setup."),
-                    ephemeral=True
-                )
-                return
+        try:
+            variant_id = int(self.values[0])
+            if self.fields:
+                modal = CustomFieldModal(self.product_id, variant_id, self.fields)
+                await interaction.response.send_modal(modal)
+            else:
+                await interaction.response.defer(ephemeral=True)
+                variant = db.fetch_one("SELECT * FROM variants WHERE id = ?", (variant_id,))
+                final_price = variant["price"] - variant["discount"]
+                gateways = db.fetch_all("SELECT * FROM payment_methods WHERE enabled = 1")
+                
+                if not gateways:
+                    await interaction.followup.send(
+                        embed=PremiumEmbed.error("Config Required", "Store has no active payment methods setup."),
+                        ephemeral=True
+                    )
+                    return
 
-            order_id = db.execute(
-                "INSERT INTO orders (user_id, product_id, variant_id, custom_inputs, price, payment_status, order_status) VALUES (?, ?, ?, ?, ?, 'Pending', 'Pending')",
-                (interaction.user.id, self.product_id, variant_id, "{}", final_price)
+                order_id = db.execute(
+                    "INSERT INTO orders (user_id, product_id, variant_id, custom_inputs, price, payment_status, order_status) VALUES (?, ?, ?, ?, ?, 'Pending', 'Pending')",
+                    (interaction.user.id, self.product_id, variant_id, "{}", final_price)
+                )
+                selector_view = PaymentGatewayView(order_id, gateways, final_price)
+                invoice_embed = PremiumEmbed.info(
+                    f"Invoice Created: #{order_id}",
+                    f"Item Selected: {variant['title']}\n"
+                    f"Price Due: {final_price:.2f} USD"
+                )
+                await interaction.followup.send(embed=invoice_embed, view=selector_view, ephemeral=True)
+        except Exception as e:
+            log.error(f"Error in VariantSelect: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+            await interaction.followup.send(
+                embed=PremiumEmbed.error("System Error", "Failed to transition to variant selection process."),
+                ephemeral=True
             )
-            selector_view = PaymentGatewayView(order_id, gateways, final_price)
-            invoice_embed = PremiumEmbed.info(
-                f"Invoice Created: #{order_id}",
-                f"Item Selected: {variant['title']}\n"
-                f"Price Due: {final_price:.2f} USD"
-            )
-            await interaction.followup.send(embed=invoice_embed, view=selector_view, ephemeral=True)
 
 
 class VariantView(discord.ui.View):
@@ -160,24 +177,30 @@ class ProductSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        product_id = int(self.values[0])
-        
-        variants = db.fetch_all("SELECT * FROM variants WHERE product_id = ? AND availability = 1", (product_id,))
-        fields = db.fetch_all("SELECT * FROM custom_fields WHERE product_id = ?", (product_id,))
-        
-        if not variants:
+        try:
+            product_id = int(self.values[0])
+            variants = db.fetch_all("SELECT * FROM variants WHERE product_id = ? AND availability = 1", (product_id,))
+            fields = db.fetch_all("SELECT * FROM custom_fields WHERE product_id = ?", (product_id,))
+            
+            if not variants:
+                await interaction.followup.send(
+                    embed=PremiumEmbed.error("Out of Stock", "This system currently does not have active variants configuration."),
+                    ephemeral=True
+                )
+                return
+
+            variant_view = VariantView(product_id, variants, fields)
+            prompt_embed = PremiumEmbed.info(
+                "Product Customizations",
+                "Select product configuration specifications from the selector block."
+            )
+            await interaction.followup.send(embed=prompt_embed, view=variant_view, ephemeral=True)
+        except Exception as e:
+            log.error(f"Error in ProductSelect: {e}")
             await interaction.followup.send(
-                embed=PremiumEmbed.error("Out of Stock", "This system currently does not have active variants configuration."),
+                embed=PremiumEmbed.error("System Error", "An error occurred retrieving products configuration."),
                 ephemeral=True
             )
-            return
-
-        variant_view = VariantView(product_id, variants, fields)
-        prompt_embed = PremiumEmbed.info(
-            "Product Customizations",
-            "Select product configuration specifications from the selector block."
-        )
-        await interaction.followup.send(embed=prompt_embed, view=variant_view, ephemeral=True)
 
 
 class ProductView(discord.ui.View):
@@ -193,64 +216,85 @@ class ShopCog(commands.Cog):
     @app_commands.command(name="shop", description="Open the boutique catalog interface.")
     async def shop(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        categories = db.fetch_all("SELECT * FROM categories WHERE enabled = 1 ORDER BY position ASC")
-        if not categories:
+        try:
+            categories = db.fetch_all("SELECT * FROM categories WHERE enabled = 1 ORDER BY position ASC")
+            if not categories:
+                await interaction.followup.send(
+                    embed=PremiumEmbed.error("Catalog Unavailable", "No active catalog categories exist yet. Ask admin to create one."),
+                    ephemeral=True
+                )
+                return
+
+            class ShopCategorySelect(discord.ui.Select):
+                def __init__(self):
+                    options = [
+                        discord.SelectOption(label=c["title"], value=str(c["id"]), description=c["description"][:100])
+                        for c in categories
+                    ]
+                    super().__init__(placeholder="Select Catalog Section", min_values=1, max_values=1, options=options)
+
+                async def callback(self, inter: discord.Interaction):
+                    await inter.response.defer(ephemeral=True)
+                    try:
+                        cat_id = int(self.values[0])
+                        products = db.fetch_all("SELECT * FROM products WHERE category_id = ? AND visibility = 1", (cat_id,))
+                        
+                        if not products:
+                            await inter.followup.send(
+                                embed=PremiumEmbed.error("Storefront Empty", "No products available under this category currently."),
+                                ephemeral=True
+                            )
+                            return
+
+                        prod_view = ProductView(products)
+                        prod_embed = PremiumEmbed.info("Selected Category Products", f"Browsing Category #{cat_id}")
+                        await inter.followup.send(embed=prod_embed, view=prod_view, ephemeral=True)
+                    except Exception as err:
+                        log.error(f"Error in ShopCategorySelect: {err}")
+                        await inter.followup.send(
+                            embed=PremiumEmbed.error("System Error", "Failed to load products for this category."),
+                            ephemeral=True
+                        )
+
+            view = discord.ui.View(timeout=120)
+            view.add_item(ShopCategorySelect())
+            
+            main_embed = PremiumEmbed.info(
+                f"{Config.BRAND_NAME} Virtual Storefront",
+                "Browse categories by making a selection below."
+            )
+            await interaction.followup.send(embed=main_embed, view=view, ephemeral=True)
+        except Exception as e:
+            log.error(f"Error in /shop command: {e}")
             await interaction.followup.send(
-                embed=PremiumEmbed.error("Catalog Unavailable", "No catalog configurations active yet."),
+                embed=PremiumEmbed.error("Database Connection Failure", f"The bot could not connect to the database. Verify your configuration in Railway logs.\n\nError: {str(e)[:150]}"),
                 ephemeral=True
             )
-            return
-
-        class ShopCategorySelect(discord.ui.Select):
-            def __init__(self):
-                options = [
-                    discord.SelectOption(label=c["title"], value=str(c["id"]), description=c["description"][:100])
-                    for c in categories
-                ]
-                super().__init__(placeholder="Select Catalog Section", min_values=1, max_values=1, options=options)
-
-            async def callback(self, inter: discord.Interaction):
-                await inter.response.defer(ephemeral=True)
-                cat_id = int(self.values[0])
-                products = db.fetch_all("SELECT * FROM products WHERE category_id = ? AND visibility = 1", (cat_id,))
-                
-                if not products:
-                    await inter.followup.send(
-                        embed=PremiumEmbed.error("Storefront Empty", "No products available under this category currently."),
-                        ephemeral=True
-                    )
-                    return
-
-                prod_view = ProductView(products)
-                prod_embed = PremiumEmbed.info("Selected Category Products", f"Browsing Category #{cat_id}")
-                await inter.followup.send(embed=prod_embed, view=prod_view, ephemeral=True)
-
-        view = discord.ui.View(timeout=120)
-        view.add_item(ShopCategorySelect())
-        
-        main_embed = PremiumEmbed.info(
-            f"{Config.BRAND_NAME} Virtual Storefront",
-            "Browse categories by making a selection below."
-        )
-        await interaction.followup.send(embed=main_embed, view=view, ephemeral=True)
 
     @app_commands.command(name="orders", description="View purchase history.")
     async def orders(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        records = db.fetch_all("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 10", (interaction.user.id,))
-        if not records:
+        try:
+            records = db.fetch_all("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 10", (interaction.user.id,))
+            if not records:
+                await interaction.followup.send(
+                    embed=PremiumEmbed.info("Order Registry Empty", "No order profiles match your unique Snowflake Identifier."),
+                    ephemeral=True
+                )
+                return
+
+            desc = ""
+            for r in records:
+                desc += f"Order ID: #{r['id']} | Total: {r['price']:.2f} USD\nPayment: {r['payment_status']} | Order: {r['order_status']}\n\n"
+
+            embed = PremiumEmbed.info("Noctra Order History", desc)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            log.error(f"Error in /orders command: {e}")
             await interaction.followup.send(
-                embed=PremiumEmbed.info("Order Registry Empty", "No order profiles match your unique Snowflake Identifier."),
+                embed=PremiumEmbed.error("Database Failure", "Could not retrieve order history."),
                 ephemeral=True
             )
-            return
-
-        desc = ""
-        for r in records:
-            desc += f"Order ID: #{r['id']} | Total: {r['price']:.2f} USD\nPayment: {r['payment_status']} | Order: {r['order_status']}\n\n"
-
-        embed = PremiumEmbed.info("Noctra Order History", desc)
-        await interaction.followup.send(embed=embed, ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(ShopCog(bot))
